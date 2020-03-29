@@ -35,11 +35,17 @@
 #include <net/netns/generic.h>
 
 #define DRV_NAME	"vrf"
-#define DRV_VERSION	"1.0"
+#define DRV_VERSION	"1.1"
 
 #define FIB_RULE_PREF  1000       /* default preference for FIB rules */
 
 static unsigned int vrf_net_id;
+
+/* per netns vrf data */
+struct netns_vrf {
+	/* protected by rtnl lock */
+	int vrf_counter;
+};
 
 struct net_vrf {
 	struct rtable __rcu	*rth;
@@ -1249,6 +1255,21 @@ out_err:
 	return err;
 }
 
+static void vrf_del_fib_rules(const struct net_device *dev)
+{
+	vrf_fib_rule(dev, AF_INET,  false);
+
+	vrf_fib_rule(dev, AF_INET6, false);
+
+#if IS_ENABLED(CONFIG_IP_MROUTE_MULTIPLE_TABLES)
+	vrf_fib_rule(dev, RTNL_FAMILY_IPMR, false);
+#endif
+
+#if IS_ENABLED(CONFIG_IPV6_MROUTE_MULTIPLE_TABLES)
+	vrf_fib_rule(dev, RTNL_FAMILY_IP6MR, false);
+#endif
+}
+
 static void vrf_setup(struct net_device *dev)
 {
 	ether_setup(dev);
@@ -1311,12 +1332,19 @@ static int vrf_validate(struct nlattr *tb[], struct nlattr *data[],
 static void vrf_dellink(struct net_device *dev, struct list_head *head)
 {
 	struct net_device *port_dev;
+	struct netns_vrf *nn_vrf;
 	struct list_head *iter;
 
 	netdev_for_each_lower_dev(dev, port_dev, iter)
 		vrf_del_slave(dev, port_dev);
 
 	unregister_netdevice_queue(dev, head);
+
+	nn_vrf = net_generic(dev_net(dev), vrf_net_id);
+
+	/* protected by rtnl lock */
+	if (--nn_vrf->vrf_counter == 0)
+		vrf_del_fib_rules(dev);
 }
 
 static int vrf_newlink(struct net *src_net, struct net_device *dev,
@@ -1324,7 +1352,7 @@ static int vrf_newlink(struct net *src_net, struct net_device *dev,
 		       struct netlink_ext_ack *extack)
 {
 	struct net_vrf *vrf = netdev_priv(dev);
-	bool *add_fib_rules;
+	struct netns_vrf *nn_vrf;
 	struct net *net;
 	int err;
 
@@ -1347,15 +1375,17 @@ static int vrf_newlink(struct net *src_net, struct net_device *dev,
 		goto out;
 
 	net = dev_net(dev);
-	add_fib_rules = net_generic(net, vrf_net_id);
-	if (*add_fib_rules) {
+	nn_vrf = net_generic(net, vrf_net_id);
+
+	/* protected by rtnl lock */
+	if (nn_vrf->vrf_counter == 0) {
 		err = vrf_add_fib_rules(dev);
 		if (err) {
 			unregister_netdevice(dev);
 			goto out;
 		}
-		*add_fib_rules = false;
 	}
+	++nn_vrf->vrf_counter;
 
 out:
 	return err;
@@ -1440,9 +1470,9 @@ static struct notifier_block vrf_notifier_block __read_mostly = {
 /* Initialize per network namespace state */
 static int __net_init vrf_netns_init(struct net *net)
 {
-	bool *add_fib_rules = net_generic(net, vrf_net_id);
+	struct netns_vrf *nn_vrf = net_generic(net, vrf_net_id);
 
-	*add_fib_rules = true;
+	nn_vrf->vrf_counter = 0;
 
 	return 0;
 }
@@ -1450,7 +1480,7 @@ static int __net_init vrf_netns_init(struct net *net)
 static struct pernet_operations vrf_net_ops __net_initdata = {
 	.init = vrf_netns_init,
 	.id   = &vrf_net_id,
-	.size = sizeof(bool),
+	.size = sizeof(struct netns_vrf),
 };
 
 static int __init vrf_init_module(void)
@@ -1476,7 +1506,16 @@ error:
 	return rc;
 }
 
+static void __exit vrf_exit_module(void)
+{
+	rtnl_link_unregister(&vrf_link_ops);
+	unregister_pernet_subsys(&vrf_net_ops);
+	unregister_netdevice_notifier(&vrf_notifier_block);
+}
+
 module_init(vrf_init_module);
+module_exit(vrf_exit_module);
+
 MODULE_AUTHOR("Shrijeet Mukherjee, David Ahern");
 MODULE_DESCRIPTION("Device driver to instantiate VRF domains");
 MODULE_LICENSE("GPL");
