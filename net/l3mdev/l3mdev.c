@@ -7,7 +7,125 @@
 
 #include <linux/netdevice.h>
 #include <net/fib_rules.h>
+#include <net/net_namespace.h>
+#include <net/netns/generic.h>
 #include <net/l3mdev.h>
+
+DEFINE_SPINLOCK(l3mdev_lock);
+
+struct l3mdev_handler {
+        enum l3mdev_type l3type;
+        int (*dev_ifindex_lookup_by_table_id)(struct net *net, u32 table_id);
+};
+
+static struct l3mdev_handler l3mdev_handlers[L3MDEV_TYPE_MAX + 1] = { 0, };
+
+int l3mdev_check_type(enum l3mdev_type l3type)
+{
+	if (l3type <= L3MDEV_TYPE_UNSPEC || l3type > L3MDEV_TYPE_MAX)
+		return -EINVAL;
+
+	return 0;
+}
+
+int l3mdev_table_lookup_register(enum l3mdev_type l3type,
+				 int (*fn) (struct net *net, u32 table_id))
+{
+	struct l3mdev_handler *hdlr;
+	int res;
+
+	res = l3mdev_check_type(l3type);
+	if (res)
+		return res;
+
+	hdlr = &l3mdev_handlers[l3type];
+
+	spin_lock(&l3mdev_lock);
+
+	if (hdlr->l3type != L3MDEV_TYPE_UNSPEC ||
+	    hdlr->dev_ifindex_lookup_by_table_id) {
+		res = -EBUSY;
+		goto unlock;
+	}
+
+	hdlr->l3type = l3type;
+	rcu_assign_pointer(hdlr->dev_ifindex_lookup_by_table_id, fn);
+
+	res = 0;
+
+unlock:
+	spin_unlock(&l3mdev_lock);
+
+	return res;
+}
+EXPORT_SYMBOL_GPL(l3mdev_table_lookup_register);
+
+int l3mdev_table_lookup_unregister(enum l3mdev_type l3type,
+				   int (*fn) (struct net *net, u32 table_id))
+{
+	struct l3mdev_handler *hdlr;
+	int res;
+
+	res = l3mdev_check_type(l3type);
+	if (res)
+		return res;
+
+	hdlr = &l3mdev_handlers[l3type];
+
+	spin_lock(&l3mdev_lock);
+
+	if (hdlr->l3type != l3type ||
+	    hdlr->dev_ifindex_lookup_by_table_id != fn) {
+		spin_unlock(&l3mdev_lock);
+		return -EINVAL;
+	}
+
+	/* removing the reference to the dev_callback;
+	 * after an elapsed grace period, no one will be able to find the
+	 * removed callback anymore.
+	 */
+	hdlr->l3type = L3MDEV_TYPE_UNSPEC;
+	rcu_assign_pointer(hdlr->dev_ifindex_lookup_by_table_id, NULL);
+
+	spin_unlock(&l3mdev_lock);
+
+	synchronize_rcu();
+
+	/* we ensure there are no outstanding rcu callbacks */
+	rcu_barrier();
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(l3mdev_table_lookup_unregister);
+
+int l3mdev_ifindex_lookup_by_table_id(struct net *net,
+				      u32 table_id, enum l3mdev_type l3type)
+{
+	int (*lookup)(struct net *, u32);
+	struct l3mdev_handler *hdlr;
+	int ifindex = -EINVAL;
+	int res;
+
+	res = l3mdev_check_type(l3type);
+	if (res)
+		return res;
+
+	hdlr = &l3mdev_handlers[l3type];
+
+	rcu_read_lock();
+
+	lookup = rcu_dereference(hdlr->dev_ifindex_lookup_by_table_id);
+	if (!lookup)
+		goto unlock;
+
+	ifindex = lookup(net, table_id);
+
+unlock:
+	rcu_read_unlock();
+
+	return ifindex;
+}
+EXPORT_SYMBOL_GPL(l3mdev_ifindex_lookup_by_table_id);
 
 /**
  *	l3mdev_master_ifindex - get index of L3 master device

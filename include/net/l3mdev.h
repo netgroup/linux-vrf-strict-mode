@@ -10,6 +10,14 @@
 #include <net/dst.h>
 #include <net/fib_rules.h>
 
+enum l3mdev_type {
+	L3MDEV_TYPE_UNSPEC,
+        L3MDEV_TYPE_VRF,
+        __L3MDEV_TYPE_MAX
+};
+
+#define L3MDEV_TYPE_MAX (__L3MDEV_TYPE_MAX - 1)
+
 /**
  * struct l3mdev_ops - l3mdev operations
  *
@@ -36,6 +44,15 @@ struct l3mdev_ops {
 };
 
 #ifdef CONFIG_NET_L3_MASTER_DEV
+
+int l3mdev_table_lookup_register(enum l3mdev_type l3type,
+				 int (*fn) (struct net *net, u32 table_id));
+
+int l3mdev_table_lookup_unregister(enum l3mdev_type l3type,
+				   int (*fn) (struct net *net, u32 table_id));
+
+int l3mdev_ifindex_lookup_by_table_id(struct net *net,
+				      u32 table_id, enum l3mdev_type l3type);
 
 int l3mdev_fib_rule_match(struct net *net, struct flowi *fl,
 			  struct fib_lookup_arg *arg);
@@ -278,6 +295,27 @@ static inline
 struct sk_buff *l3mdev_ip6_out(struct sock *sk, struct sk_buff *skb)
 {
 	return skb;
+}
+
+static inline
+int l3mdev_table_lookup_register(enum l3mdev_type l3type,
+				 int (*fn) (struct net *net, u32 table_id))
+{
+	return 0;
+}
+
+static inline
+int l3mdev_table_lookup_unregister(enum l3mdev_type l3type,
+				   int (*fn) (struct net *net, u32 table_id))
+{
+	return 0;
+}
+
+static inline
+int l3mdev_ifindex_lookup_by_table_id(struct net *net,
+				      u32 table_id, enum l3mdev_type l3type)
+{
+	return -ENODEV;
 }
 
 static inline
