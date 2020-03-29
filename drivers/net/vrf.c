@@ -21,6 +21,7 @@
 #include <net/rtnetlink.h>
 #include <linux/u64_stats_sync.h>
 #include <linux/hashtable.h>
+#include <linux/spinlock_types.h>
 
 #include <linux/inetdevice.h>
 #include <net/arp.h>
@@ -35,11 +36,89 @@
 #include <net/netns/generic.h>
 
 #define DRV_NAME	"vrf"
-#define DRV_VERSION	"1.0"
+#define DRV_VERSION	"1.1"
 
 #define FIB_RULE_PREF  1000       /* default preference for FIB rules */
 
+#define HT_MAP_BITS	4
+#define HASH_INITVAL	((u32)0xcafef00d)
+
+#define STRICT_MODE_DISABLED	0
+#define STRICT_MODE_ENABLED	1
+
+struct  vrf_map {
+	/* it protects the vrf_map, vrf_map_elem and vif_elem */
+	spinlock_t vmap_lock;
+
+	DECLARE_HASHTABLE(ht, HT_MAP_BITS);
+
+	/* shared_tables:
+	 * count how many distinct tables does not comply with the
+	 * strict mode requirement.
+	 * shared_table value must be 0 in order to switch to strict mode.
+	 *
+	 * example of evolution of shared_table:
+	 *                                                        | time
+	 * add  vrf0 --> table 100        shared_tables = 0       | t0
+	 * add  vrf1 --> table 101        shared_tables = 0       | t1
+	 * add  vrf2 --> table 100        shared_tables = 1       | t2
+	 * add  vrf3 --> table 100        shared_tables = 1       | t3
+	 * add  vrf4 --> table 101        shared_tables = 2       v t4
+	 *
+	 * shared_tables is a "step function" (or "staircase function")
+	 * and is increased by one when the second vrf is associated to a table
+	 *
+	 * at t2, vrf0 and vrf2 are bound to table 100: shared_table = 1.
+	 *
+	 * at t3, another dev (vrf3) is bound to the same table 100 but the
+	 * shared_table counters is still 1.
+	 * This means that no matter how many new vrfs will register on the
+	 * table 100, the shared_table will not increase (considering only
+	 * table 100).
+	 *
+	 * at t4, vrf4 is bound to table 101, and shared_table = 2.
+	 *
+	 * Looking at the value of shared_tables we can immediately know if
+	 * the strict_mode can or cannot be enforced. Indeed, strict_mode
+	 * can be enforced iff shared_table = 0.
+	 *
+	 * Conversely, shared_table is decreased when a vrf is de-associated
+	 * from a table with exactly two associated vrfs.
+	 */
+	int shared_tables;
+
+	int strict_mode;
+};
+
+/* vrf ifindex element used for tracking vrfs associated with a given table */
+struct vif_elem {
+	struct list_head list;
+
+	int ifindex;
+};
+
+struct vrf_map_elem {
+	/* protected by vmap_lock */
+	struct hlist_node hnode;
+
+	u32 table_id;
+	int users;
+
+	/* list of vrfs that are registered to the specific table */
+	struct list_head vif_list_head;
+
+	int ifindex;
+};
+
 static unsigned int vrf_net_id;
+
+/* per netns vrf data */
+struct netns_vrf {
+	/* protected by rtnl lock */
+	bool add_fib_rules;
+
+	struct vrf_map vmap;
+};
 
 struct net_vrf {
 	struct rtable __rcu	*rth;
@@ -101,6 +180,291 @@ static void vrf_get_stats64(struct net_device *dev,
 		stats->rx_bytes += rbytes;
 		stats->rx_packets += rpkts;
 	}
+}
+
+static struct vrf_map *netns_vrf_map(struct net_device *dev)
+{
+	struct netns_vrf *nn_vrf = net_generic(dev_net(dev), vrf_net_id);
+
+	return &nn_vrf->vmap;
+}
+
+static struct vif_elem *vif_elem_alloc(gfp_t flags)
+{
+	struct vif_elem *ve;
+
+	ve = kmalloc(sizeof(*ve), flags);
+	if (!ve)
+		return NULL;
+
+	return ve;
+}
+
+static void vif_elem_free(struct vif_elem *ve)
+{
+	kfree(ve);
+}
+
+static void vif_elem_init(struct vif_elem *ve, int ifindex)
+{
+	ve->ifindex = ifindex;
+}
+
+static void vrf_map_elem_add_vif(struct vrf_map_elem *me, struct vif_elem *ve)
+{
+	struct list_head *me_head = &me->vif_list_head;
+	struct list_head *ve_head = &ve->list;
+
+	list_add(ve_head, me_head);
+}
+
+static struct vif_elem *
+vrf_map_elem_search_and_remove_vif(struct vrf_map_elem *me, int ifindex)
+{
+	struct list_head *me_head = &me->vif_list_head;
+	struct vif_elem *e, *n;
+
+	list_for_each_entry_safe(e, n, me_head, list) {
+		if (e->ifindex == ifindex) {
+			/* remove the vif_elem from the list in vrf_map_elem */
+			list_del(&e->list);
+			return e;
+		}
+	}
+
+	return NULL;
+}
+
+static struct vif_elem *vrf_map_elem_peek_first_vif(struct vrf_map_elem *me)
+{
+	struct list_head *me_head = &me->vif_list_head;
+
+	if (list_empty(me_head))
+		return NULL;
+
+	return list_first_entry(me_head, struct vif_elem, list);
+}
+
+static struct vrf_map_elem *vrf_map_elem_alloc(gfp_t flags)
+{
+	struct vrf_map_elem *me;
+
+	me = kmalloc(sizeof(*me), flags);
+	if (!me)
+		return NULL;
+
+	return me;
+}
+
+static void vrf_map_elem_free(struct vrf_map_elem *me)
+{
+	kfree(me);
+}
+
+static void vrf_map_elem_init(struct vrf_map_elem *me, int table_id,
+			      int ifindex, int users)
+{
+	me->table_id = table_id;
+	me->ifindex = ifindex;
+	me->users = users;
+	INIT_LIST_HEAD(&me->vif_list_head);
+}
+
+static struct vrf_map_elem *vrf_map_lookup_elem(struct vrf_map *vmap,
+						u32 table_id)
+{
+	struct vrf_map_elem *me;
+	u32 key;
+
+	key = jhash_1word(table_id, HASH_INITVAL);
+	hash_for_each_possible(vmap->ht, me, hnode, key) {
+		if (me->table_id == table_id)
+			return me;
+	}
+
+	return NULL;
+}
+
+static void vrf_map_add_elem(struct vrf_map *vmap, struct vrf_map_elem *me)
+{
+	u32 table_id = me->table_id;
+	u32 key;
+
+	key = jhash_1word(table_id, HASH_INITVAL);
+	hash_add(vmap->ht, &me->hnode, key);
+}
+
+static void vrf_map_lock(struct vrf_map *vmap)
+{
+	spin_lock(&vmap->vmap_lock);
+}
+
+static void vrf_map_unlock(struct vrf_map *vmap)
+{
+	spin_unlock(&vmap->vmap_lock);
+}
+
+/* called with rtnl lock held */
+static int vrf_map_register_dev(struct net_device *dev)
+{
+	bool free_new_me = false, free_ve = false;
+	struct vrf_map *vmap = netns_vrf_map(dev);
+	struct net_vrf *vrf = netdev_priv(dev);
+	struct vrf_map_elem *new_me, *me;
+	u32 table_id = vrf->tb_id;
+	struct vif_elem *ve;
+	int users;
+	int res;
+
+	/* we pre-allocate elements used in the spin-locked section (so that we
+	 * keep the spinlock as short as possibile).
+	 */
+	new_me = vrf_map_elem_alloc(GFP_KERNEL);
+	if (!new_me)
+		return -ENOMEM;
+
+	ve = vif_elem_alloc(GFP_KERNEL);
+	if (!ve) {
+		vrf_map_elem_free(new_me);
+		return -ENOMEM;
+	}
+
+	vrf_map_elem_init(new_me, table_id, dev->ifindex, 1);
+	vif_elem_init(ve, dev->ifindex);
+
+	vrf_map_lock(vmap);
+
+	me = vrf_map_lookup_elem(vmap, table_id);
+	if (me)
+		goto elem_exist;
+
+	vrf_map_elem_add_vif(new_me, ve);
+	vrf_map_add_elem(vmap, new_me);
+
+	res = 0;
+
+	goto unlock;
+
+elem_exist:
+	/* we already have an entry in the vrf_map, so it means there is (at
+	 * least) a vrf registered on the specific table.
+	 */
+	free_new_me = true;
+	if (vmap->strict_mode == STRICT_MODE_ENABLED) {
+		/* vrfs cannot share the same table */
+		free_ve = true;
+		res = -EPERM;
+		goto unlock;
+	}
+
+	users = ++me->users;
+	if (users == 2)
+		++vmap->shared_tables;
+
+	/* we add the vrf to the list of registered devices for this table;
+	 * we also invalidate the vrf<->table binding because more than one vrf
+	 * is registered to the same table.
+	 */
+	vrf_map_elem_add_vif(me, ve);
+	me->ifindex = -1;
+
+	res = 0;
+
+unlock:
+	vrf_map_unlock(vmap);
+
+	/* clean-up, if needed */
+	if (free_ve)
+		vif_elem_free(ve);
+	if (free_new_me)
+		vrf_map_elem_free(new_me);
+
+	return res;
+}
+
+/* called with rtnl lock held */
+static int vrf_map_unregister_dev(struct net_device *dev)
+{
+	struct vif_elem *ve = NULL, *first_ve = NULL;
+	struct vrf_map *vmap = netns_vrf_map(dev);
+	struct net_vrf *vrf = netdev_priv(dev);
+	u32 table_id = vrf->tb_id;
+	struct vrf_map_elem *me;
+	int users;
+	int res;
+
+	vrf_map_lock(vmap);
+
+	me = vrf_map_lookup_elem(vmap, table_id);
+	if (!me) {
+		res = -EINVAL;
+		goto unlock;
+	}
+
+	/* we remove the vrf from the list of registered vrfs for the table */
+	ve = vrf_map_elem_search_and_remove_vif(me, dev->ifindex);
+
+	/* XXX: ve SHOULD never be NULL at this point, do we want to use WARN
+	 * here ?
+	 */
+
+	users = me->users--;
+	if (users == 2) {
+		--vmap->shared_tables;
+
+		/* we peek the vrf bound to the table */
+		first_ve = vrf_map_elem_peek_first_vif(me);
+		if (first_ve)
+			me->ifindex = first_ve->ifindex;
+
+		/* XXX: very weird if there is no vrf left (first_ve ==
+		 * NULL)... do we want to use WARN here ?
+		 */
+
+	} else if (users == 1) {
+		/* no one will refer to this element anymore */
+		vrf_map_elem_free(me);
+	}
+
+	res = 0;
+
+unlock:
+	vrf_map_unlock(vmap);
+
+	vif_elem_free(ve);
+
+	return res;
+}
+
+/* NOTE: callable only in process context;
+ * returns the vrf device index associated with the table_id
+ */
+static int vrf_ifindex_lookup_by_table_id(struct net *net, u32 table_id)
+{
+	struct netns_vrf *nn_vrf = net_generic(net, vrf_net_id);
+	struct vrf_map *vmap = &nn_vrf->vmap;
+	struct vrf_map_elem *me;
+	int ifindex;
+
+	vrf_map_lock(vmap);
+
+	if (vmap->strict_mode != STRICT_MODE_ENABLED) {
+		ifindex = -EPERM;
+		goto unlock;
+	}
+
+	me = vrf_map_lookup_elem(vmap, table_id);
+	if (!me) {
+		ifindex = -ENODEV;
+		goto unlock;
+	}
+
+	ifindex = me->ifindex;
+
+unlock:
+	vrf_map_unlock(vmap);
+
+	return ifindex;
 }
 
 /* by default VRF devices do not have a qdisc and are expected
@@ -1316,6 +1680,8 @@ static void vrf_dellink(struct net_device *dev, struct list_head *head)
 	netdev_for_each_lower_dev(dev, port_dev, iter)
 		vrf_del_slave(dev, port_dev);
 
+	vrf_map_unregister_dev(dev);
+
 	unregister_netdevice_queue(dev, head);
 }
 
@@ -1324,6 +1690,7 @@ static int vrf_newlink(struct net *src_net, struct net_device *dev,
 		       struct netlink_ext_ack *extack)
 {
 	struct net_vrf *vrf = netdev_priv(dev);
+	struct netns_vrf *nn_vrf;
 	bool *add_fib_rules;
 	struct net *net;
 	int err;
@@ -1346,15 +1713,28 @@ static int vrf_newlink(struct net *src_net, struct net_device *dev,
 	if (err)
 		goto out;
 
+	/* mapping between table_id and vrf;
+	 * note: such binding could not be done in the dev init function
+	 * because dev->ifindex id is not available yet.
+	 */
+	err = vrf_map_register_dev(dev);
+	if (err) {
+		unregister_netdevice(dev);
+		goto out;
+	}
+
 	net = dev_net(dev);
-	add_fib_rules = net_generic(net, vrf_net_id);
+	nn_vrf = net_generic(net, vrf_net_id);
+
+	add_fib_rules = &nn_vrf->add_fib_rules;
 	if (*add_fib_rules) {
 		err = vrf_add_fib_rules(dev);
 		if (err) {
+			vrf_map_unregister_dev(dev);
 			unregister_netdevice(dev);
 			goto out;
 		}
-		*add_fib_rules = false;
+		*add_fib_rules = true;
 	}
 
 out:
@@ -1437,12 +1817,23 @@ static struct notifier_block vrf_notifier_block __read_mostly = {
 	.notifier_call = vrf_device_event,
 };
 
+static int vrf_map_init(struct vrf_map *vmap)
+{
+	spin_lock_init(&vmap->vmap_lock);
+	hash_init(vmap->ht);
+
+	vmap->strict_mode = STRICT_MODE_DISABLED;
+
+	return 0;
+}
+
 /* Initialize per network namespace state */
 static int __net_init vrf_netns_init(struct net *net)
 {
-	bool *add_fib_rules = net_generic(net, vrf_net_id);
+	struct netns_vrf *nn_vrf = net_generic(net, vrf_net_id);
 
-	*add_fib_rules = true;
+	nn_vrf->add_fib_rules = true;
+	vrf_map_init(&nn_vrf->vmap);
 
 	return 0;
 }
@@ -1450,7 +1841,7 @@ static int __net_init vrf_netns_init(struct net *net)
 static struct pernet_operations vrf_net_ops __net_initdata = {
 	.init = vrf_netns_init,
 	.id   = &vrf_net_id,
-	.size = sizeof(bool),
+	.size = sizeof(struct netns_vrf),
 };
 
 static int __init vrf_init_module(void)
@@ -1477,6 +1868,7 @@ error:
 }
 
 module_init(vrf_init_module);
+
 MODULE_AUTHOR("Shrijeet Mukherjee, David Ahern");
 MODULE_DESCRIPTION("Device driver to instantiate VRF domains");
 MODULE_LICENSE("GPL");
