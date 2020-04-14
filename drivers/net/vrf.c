@@ -51,8 +51,12 @@ struct  vrf_map {
 
 	DECLARE_HASHTABLE(ht, HT_MAP_BITS);
 
-	/* count how many distinct tables are shared among vrfs, i.e:
+	/* shared_tables
+	 * count how many distinct tables does not comply with the
+	 * strict mode requirement 
+	 * it must be 0 in order to switch to strict mode
 	 *
+	 * example of evolution of shared_table:
 	 *                                                        | time
 	 * add  vrf0 --> table 100        shared_tables = 0       | t0
 	 * add  vrf1 --> table 101	  shared_tables = 0	  | t1
@@ -60,8 +64,8 @@ struct  vrf_map {
 	 * add  vrf3 --> table 100	  shared_tables = 1       | t3
 	 * add  vrf4 --> table 101	  shared_tables = 2       v t4
 	 *
-	 * shared_tables is a "step function" and is increased (once) when two
-	 * or more vrfs share the same table.
+	 * shared_tables is a "step function" (or "staircase function") 
+	 * and is increased by one when the second vrf is associated to a table
 	 *
 	 * at t2, vrf0 and vrf2 are bound to table 100: shared_table = 1.
 	 *
@@ -77,8 +81,9 @@ struct  vrf_map {
 	 * the strict_mode can or cannot be enforced. Indeed, strict_mode
 	 * can be enforced iff shared_table = 0.
 	 *
-	 * Conversely, shared_table is decreased (once) when no more than one
-	 * vrf is bound to a specific table.
+	 * Conversely, shared_table is decreased when a vrf is de-associated
+	 * from a table with exactly two associated vrfs
+	 *
 	 */
 	int shared_tables;
 
