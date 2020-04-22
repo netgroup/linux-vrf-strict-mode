@@ -118,6 +118,7 @@ struct netns_vrf {
 	bool add_fib_rules;
 
 	struct vrf_map vmap;
+	struct ctl_table_header	*ctl_hdr;
 };
 
 struct net_vrf {
@@ -302,6 +303,73 @@ static void vrf_map_lock(struct vrf_map *vmap)
 static void vrf_map_unlock(struct vrf_map *vmap)
 {
 	spin_unlock(&vmap->vmap_lock);
+}
+
+static int vrf_strict_mode(struct vrf_map *vmap)
+{
+	int strict_mode;
+
+	vrf_map_lock(vmap);
+	strict_mode = vmap->strict_mode;
+	vrf_map_unlock(vmap);
+
+	return strict_mode;
+}
+
+static int vrf_strict_mode_change(struct vrf_map *vmap, int new_mode)
+{
+	int *cur_mode;
+	int res = 0;
+
+	vrf_map_lock(vmap);
+
+	cur_mode = &vmap->strict_mode;
+	if (*cur_mode == new_mode)
+		goto unlock;
+
+	res = -EINVAL;
+
+	switch (*cur_mode) {
+	case STRICT_MODE_ENABLED:
+		if (new_mode != STRICT_MODE_DISABLED)
+			goto unlock;
+
+		*cur_mode = STRICT_MODE_DISABLED;
+		res = 0;
+
+		break;
+
+	case STRICT_MODE_DISABLED:
+		if (new_mode != STRICT_MODE_ENABLED)
+			goto unlock;
+
+		if (!vmap->shared_tables) {
+			/* no tables are shared among vrfs, so we can go back
+			 * to 1:1 association between a vrf with its table.
+			 */
+			*cur_mode = STRICT_MODE_ENABLED;
+			res = 0;
+		} else {
+			/* we cannot allow strict_mode because there are some
+			 * vrfs that share one or more tables.
+			 * Therefore, an appropriate error message seems to be
+			 * EBUSY instead of EINVAL.
+			 */
+			res = -EBUSY;
+		}
+
+		break;
+
+	default:
+		/* it should not ever happen! */
+		res = -ENOTSUPP;
+		break;
+	};
+
+unlock:
+	vrf_map_unlock(vmap);
+
+	return res;
 }
 
 /* called with rtnl lock held */
@@ -1827,19 +1895,89 @@ static int vrf_map_init(struct vrf_map *vmap)
 	return 0;
 }
 
+static int
+vrf_shared_table_handler(struct ctl_table *table, int write,
+			 void __user *buffer, size_t *lenp, loff_t *ppos)
+{
+	struct netns_vrf *nn_vrf = net_generic((struct net *)table->extra1,
+					       vrf_net_id);
+	struct vrf_map *vmap = &nn_vrf->vmap;
+	int proc_strict_mode = 0;
+	struct ctl_table tmp = {
+		.procname	= table->procname,
+		.data		= &proc_strict_mode,
+		.maxlen		= sizeof(int),
+		.mode		= table->mode,
+	};
+	int ret;
+
+	if (!write)
+		proc_strict_mode = vrf_strict_mode(vmap);
+
+	ret = proc_dointvec(&tmp, write, buffer, lenp, ppos);
+
+	if (write && ret == 0)
+		ret = vrf_strict_mode_change(vmap, proc_strict_mode);
+
+	return ret;
+}
+
+static const struct ctl_table vrf_table[] = {
+	{
+		.procname	= "strict_mode",
+		.data		= NULL,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= vrf_shared_table_handler,
+		.extra1		= NULL,
+	},
+	{ },
+};
+
 /* Initialize per network namespace state */
 static int __net_init vrf_netns_init(struct net *net)
 {
 	struct netns_vrf *nn_vrf = net_generic(net, vrf_net_id);
+	struct ctl_table *table;
+	int res;
 
 	nn_vrf->add_fib_rules = true;
 	vrf_map_init(&nn_vrf->vmap);
 
+	table = kmemdup(vrf_table, sizeof(vrf_table), GFP_KERNEL);
+	if (!table)
+		return -ENOMEM;
+
+	/* init the extra1 parameter with the reference to current netns */
+	table[0].extra1 = net;
+
+	nn_vrf->ctl_hdr = register_net_sysctl(net, "net/vrf", table);
+	if (!nn_vrf->ctl_hdr) {
+		res = -ENOMEM;
+		goto free_table;
+	}
+
 	return 0;
+
+free_table:
+	kfree(table);
+
+	return res;
+}
+
+static void __net_exit vrf_netns_exit(struct net *net)
+{
+	struct netns_vrf *nn_vrf = net_generic(net, vrf_net_id);
+	struct ctl_table *table;
+
+	table = nn_vrf->ctl_hdr->ctl_table_arg;
+	unregister_net_sysctl_table(nn_vrf->ctl_hdr);
+	kfree(table);
 }
 
 static struct pernet_operations vrf_net_ops __net_initdata = {
 	.init = vrf_netns_init,
+	.exit = vrf_netns_exit,
 	.id   = &vrf_net_id,
 	.size = sizeof(struct netns_vrf),
 };
