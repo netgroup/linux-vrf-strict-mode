@@ -1992,13 +1992,23 @@ static int __init vrf_init_module(void)
 	if (rc < 0)
 		goto error;
 
+	rc = l3mdev_table_lookup_register(L3MDEV_TYPE_VRF,
+					  vrf_ifindex_lookup_by_table_id);
+	if (rc < 0)
+		goto unreg_pernet;
+
 	rc = rtnl_link_register(&vrf_link_ops);
-	if (rc < 0) {
-		unregister_pernet_subsys(&vrf_net_ops);
-		goto error;
-	}
+	if (rc < 0)
+		goto table_lookup_unreg;
 
 	return 0;
+
+table_lookup_unreg:
+	l3mdev_table_lookup_unregister(L3MDEV_TYPE_VRF,
+				       vrf_ifindex_lookup_by_table_id);
+
+unreg_pernet:
+	unregister_pernet_subsys(&vrf_net_ops);
 
 error:
 	unregister_netdevice_notifier(&vrf_notifier_block);
